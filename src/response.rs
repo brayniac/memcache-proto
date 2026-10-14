@@ -11,6 +11,7 @@
 //! - `SERVER_ERROR <msg>\r\n` - Server error
 
 use crate::error::ParseError;
+use crate::input::{Input, Segments};
 use bytes::Bytes;
 use std::io::Write;
 
@@ -671,6 +672,38 @@ impl ResponseBytes {
 
         Err(ParseError::Protocol("unknown response"))
     }
+
+    /// Parse a response from bytes that arrived in several pieces.
+    ///
+    /// `segments` are consecutive pieces of one byte stream, in order, as a
+    /// receive path that does not copy them into one buffer delivers them.
+    /// The result is the same as [`parse`](Self::parse) on the pieces joined:
+    /// the same response, the same number of bytes consumed (counted across
+    /// pieces), and the same errors. A key, value or message within one piece
+    /// is a `Bytes::slice()` reference into it; one that spans pieces is
+    /// copied into a new `Bytes`.
+    ///
+    /// Each call is linear in the number of pieces. Piece offsets are kept on
+    /// the stack for up to eight pieces and in a heap buffer above that, and a
+    /// line or field that spans pieces is copied. A caller that retries after
+    /// [`ParseError::Incomplete`] as pieces arrive should join small pieces
+    /// first, or the retries cost the square of the piece count.
+    #[inline]
+    pub fn parse_segments(segments: &[Bytes]) -> Result<(Self, usize), ParseError> {
+        Self::parse_segments_with_max_line_len(segments, DEFAULT_MAX_RESPONSE_LINE_LEN)
+    }
+
+    /// Parse a response from bytes in several pieces, with an explicit
+    /// maximum line length. See [`parse_segments`](Self::parse_segments).
+    pub fn parse_segments_with_max_line_len(
+        segments: &[Bytes],
+        max_line_len: usize,
+    ) -> Result<(Self, usize), ParseError> {
+        if let [one] = segments {
+            return Self::parse_with_max_line_len(one.clone(), max_line_len);
+        }
+        parse_response_at(&Segments::new(segments), max_line_len)
+    }
 }
 
 /// Parse a VALUE response producing zero-copy `ValueBytes` with `Bytes::slice()`.
@@ -733,6 +766,149 @@ fn parse_value_response_bytes(
         }
 
         let value_data = data.slice(pos..data_end);
+        pos = data_end + 2;
+
+        values.push(ValueBytes {
+            key,
+            flags,
+            data: value_data,
+            cas,
+        });
+    }
+
+    Ok((ResponseBytes::Values(values), pos))
+}
+
+// ========================================================================
+// Segmented parsing
+// ========================================================================
+//
+// `parse_segments` with more than one piece parses over an `Input`. One piece,
+// and `parse`, use the contiguous functions above; tests/segments.rs compares
+// both with the copy parser.
+
+/// The kind of a response, decided from its first line.
+enum FirstLine {
+    Simple(ResponseBytes),
+    /// `CLIENT_ERROR`, `SERVER_ERROR` or `VERSION`: the message starts this
+    /// many bytes into the line.
+    Message(fn(Bytes) -> ResponseBytes, usize),
+    Values,
+    Numeric(u64),
+}
+
+#[inline]
+fn classify_first_line(line: &[u8]) -> Result<FirstLine, ParseError> {
+    let simple = match line {
+        b"STORED" => Some(ResponseBytes::Stored),
+        b"NOT_STORED" => Some(ResponseBytes::NotStored),
+        b"DELETED" => Some(ResponseBytes::Deleted),
+        b"NOT_FOUND" => Some(ResponseBytes::NotFound),
+        b"EXISTS" => Some(ResponseBytes::Exists),
+        b"END" => Some(ResponseBytes::Values(vec![])),
+        b"OK" => Some(ResponseBytes::Ok),
+        b"ERROR" => Some(ResponseBytes::Error),
+        _ => None,
+    };
+    if let Some(response) = simple {
+        return Ok(FirstLine::Simple(response));
+    }
+    if line.starts_with(b"CLIENT_ERROR ") {
+        return Ok(FirstLine::Message(ResponseBytes::ClientError, 13));
+    }
+    if line.starts_with(b"SERVER_ERROR ") {
+        return Ok(FirstLine::Message(ResponseBytes::ServerError, 13));
+    }
+    if line.starts_with(b"VERSION ") {
+        return Ok(FirstLine::Message(ResponseBytes::Version, 8));
+    }
+    if line.starts_with(b"VALUE ") {
+        return Ok(FirstLine::Values);
+    }
+    if !line.is_empty() && line.iter().all(|&b| b.is_ascii_digit()) {
+        return Ok(FirstLine::Numeric(parse_u64(line)?));
+    }
+    Err(ParseError::Protocol("unknown response"))
+}
+
+/// Parse one response from the start of `inp`.
+fn parse_response_at<I: Input>(
+    inp: &I,
+    max_line_len: usize,
+) -> Result<(ResponseBytes, usize), ParseError> {
+    let line_end = inp
+        .find_crlf(0, max_line_len)?
+        .ok_or(ParseError::Incomplete)?;
+    match inp.with_range(0, line_end, classify_first_line)? {
+        FirstLine::Simple(response) => Ok((response, line_end + 2)),
+        FirstLine::Message(make, start) => Ok((make(inp.slice(start, line_end)), line_end + 2)),
+        FirstLine::Values => parse_value_response_at(inp, max_line_len),
+        FirstLine::Numeric(value) => Ok((ResponseBytes::Numeric(value), line_end + 2)),
+    }
+}
+
+/// The fields of a `VALUE <key> <flags> <bytes> [<cas>]` line: the key's
+/// length, the flags, the data length and the CAS token.
+#[inline]
+fn parse_value_line(line: &[u8]) -> Result<(usize, u32, usize, Option<u64>), ParseError> {
+    if !line.starts_with(b"VALUE ") {
+        return Err(ParseError::Protocol("expected VALUE or END"));
+    }
+    let parts: Vec<&[u8]> = line[6..].split(|&b| b == b' ').collect();
+    if parts.len() < 3 {
+        return Err(ParseError::Protocol("invalid VALUE line"));
+    }
+    let flags = parse_u32(parts[1])?;
+    let bytes = parse_usize(parts[2])?;
+    let cas = if parts.len() >= 4 {
+        Some(parse_u64(parts[3])?)
+    } else {
+        None
+    };
+    Ok((parts[0].len(), flags, bytes, cas))
+}
+
+/// Parse a VALUE response producing zero-copy `ValueBytes`.
+fn parse_value_response_at<I: Input>(
+    inp: &I,
+    max_line_len: usize,
+) -> Result<(ResponseBytes, usize), ParseError> {
+    let mut values = Vec::new();
+    let mut pos = 0;
+
+    loop {
+        let line_end = inp
+            .find_crlf(pos, max_line_len)?
+            .ok_or(ParseError::Incomplete)?;
+        let fields = inp.with_range(pos, line_end, |line| {
+            if line == b"END" {
+                Ok(None)
+            } else {
+                parse_value_line(line).map(Some)
+            }
+        })?;
+        let Some((key_len, flags, bytes, cas)) = fields else {
+            pos = line_end + 2;
+            break;
+        };
+
+        let key_start = pos + 6; // skip "VALUE "
+        let key = inp.slice(key_start, key_start + key_len);
+
+        // Move past the VALUE line
+        pos = line_end + 2;
+
+        // Read the data
+        let data_end = pos + bytes;
+        if inp.len() < data_end + 2 {
+            return Err(ParseError::Incomplete);
+        }
+
+        if inp.byte(data_end) != b'\r' || inp.byte(data_end + 1) != b'\n' {
+            return Err(ParseError::Protocol("missing data terminator"));
+        }
+
+        let value_data = inp.slice(pos, data_end);
         pos = data_end + 2;
 
         values.push(ValueBytes {

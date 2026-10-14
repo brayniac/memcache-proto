@@ -59,6 +59,8 @@
 mod command;
 mod error;
 #[cfg(feature = "ascii")]
+mod input;
+#[cfg(feature = "ascii")]
 mod request;
 #[cfg(feature = "ascii")]
 mod response;
