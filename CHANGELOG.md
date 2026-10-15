@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ResponseBytes::parse_segments` and
+  `ResponseBytes::parse_segments_with_max_line_len` parse a response from bytes
+  that arrived in several pieces (`&[Bytes]`), as a receive path that does not
+  copy them into one buffer delivers them. The result is what `parse` gives on
+  the pieces joined: the same response, consumed count and error. A key, value
+  or message within one piece is a slice of it; one that spans pieces is
+  copied. One piece is parsed by `parse`; `parse` itself is unchanged.
+
 ## [0.0.5] - 2026-08-19
 
 ### Fixed
