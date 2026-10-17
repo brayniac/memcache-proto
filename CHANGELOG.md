@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the pieces joined: the same response, consumed count and error. A key, value
   or message within one piece is a slice of it; one that spans pieces is
   copied. One piece is parsed by `parse`; `parse` itself is unchanged.
+- `ResponseBytes::scan_segments` and
+  `ResponseBytes::scan_segments_with_max_line_len` find the end of the
+  response at the start of several pieces without building it:
+  `Frame::Complete(len)` with the length `parse_segments` would consume,
+  `Frame::Incomplete(n)` with a lower bound on the bytes still needed, or the
+  error the parse would return. A caller can scan on each arrival and parse
+  once, so an incomplete response's keys and values that span pieces are not
+  copied and discarded on every arrival.
 
 ## [0.0.5] - 2026-08-19
 

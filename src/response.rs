@@ -704,6 +704,136 @@ impl ResponseBytes {
         }
         parse_response_at(&Segments::new(segments), max_line_len)
     }
+
+    /// Find the end of the response at the start of `segments` without
+    /// building it.
+    ///
+    /// Returns [`Frame::Complete`] with the byte count
+    /// [`parse_segments`](Self::parse_segments) would consume, or
+    /// [`Frame::Incomplete`] with a lower bound on the bytes still needed,
+    /// and the same errors that parse would return. It does not copy a
+    /// value's data. It allocates the piece offset table above eight pieces
+    /// and a copy of each line that spans pieces. A caller that receives
+    /// bytes in pieces can call it on each arrival and parse once the
+    /// response is complete: a parse of an incomplete response copies each
+    /// key and value that spans pieces, and then discards the copies.
+    #[inline]
+    pub fn scan_segments(segments: &[Bytes]) -> Result<Frame, ParseError> {
+        Self::scan_segments_with_max_line_len(segments, DEFAULT_MAX_RESPONSE_LINE_LEN)
+    }
+
+    /// Find the end of a response in several pieces, with an explicit
+    /// maximum line length. See [`scan_segments`](Self::scan_segments).
+    pub fn scan_segments_with_max_line_len(
+        segments: &[Bytes],
+        max_line_len: usize,
+    ) -> Result<Frame, ParseError> {
+        scan_response_at(&Segments::new(segments), max_line_len)
+    }
+}
+
+/// The result of [`ResponseBytes::scan_segments`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Frame {
+    /// The input starts with a complete response of this many bytes.
+    Complete(usize),
+    /// The input is the start of a response that needs at least this many
+    /// more bytes.
+    Incomplete(usize),
+}
+
+/// The bytes in the shortest response (`0\r\n`, a numeric reply).
+const MIN_RESPONSE_LEN: usize = 3;
+
+/// The bytes that end a `VALUE` response: `END\r\n`.
+const END_LEN: usize = 5;
+
+/// The position of the CR that ends the line at `pos`, or, when the input
+/// holds no CRLF after `pos` yet, the bytes still needed: 1 after a final CR,
+/// 2 otherwise.
+#[inline]
+fn scan_line<I: Input>(
+    inp: &I,
+    pos: usize,
+    max_line_len: usize,
+) -> Result<Result<usize, usize>, ParseError> {
+    match inp.find_crlf(pos, max_line_len)? {
+        Some(cr) => Ok(Ok(cr)),
+        None if pos < inp.len() && inp.byte(inp.len() - 1) == b'\r' => Ok(Err(1)),
+        None => Ok(Err(2)),
+    }
+}
+
+/// Scan one response from the start of `inp`, with the checks of
+/// [`parse_response_at`] in its order.
+fn scan_response_at<I: Input>(inp: &I, max_line_len: usize) -> Result<Frame, ParseError> {
+    if inp.len() == 0 {
+        return Ok(Frame::Incomplete(MIN_RESPONSE_LEN));
+    }
+    let line_end = match scan_line(inp, 0, max_line_len)? {
+        Ok(end) => end,
+        Err(short) => return Ok(Frame::Incomplete(short)),
+    };
+    match inp.with_range(0, line_end, classify_first_line)? {
+        FirstLine::Values => scan_value_response_at(inp, max_line_len),
+        _ => Ok(Frame::Complete(line_end + 2)),
+    }
+}
+
+/// [`parse_value_line`]'s checks, in its order, without collecting the
+/// fields: the data length.
+#[inline]
+fn scan_value_line(line: &[u8]) -> Result<usize, ParseError> {
+    if !line.starts_with(b"VALUE ") {
+        return Err(ParseError::Protocol("expected VALUE or END"));
+    }
+    let mut parts = line[6..].split(|&b| b == b' ');
+    let _key = parts.next();
+    let (Some(flags), Some(bytes)) = (parts.next(), parts.next()) else {
+        return Err(ParseError::Protocol("invalid VALUE line"));
+    };
+    parse_u32(flags)?;
+    let bytes = parse_usize(bytes)?;
+    if let Some(cas) = parts.next() {
+        parse_u64(cas)?;
+    }
+    Ok(bytes)
+}
+
+/// Scan a VALUE response, with the checks of [`parse_value_response_at`] in
+/// its order.
+fn scan_value_response_at<I: Input>(inp: &I, max_line_len: usize) -> Result<Frame, ParseError> {
+    let mut pos = 0;
+    loop {
+        if pos >= inp.len() {
+            return Ok(Frame::Incomplete(END_LEN));
+        }
+        let line_end = match scan_line(inp, pos, max_line_len)? {
+            Ok(end) => end,
+            Err(short) => return Ok(Frame::Incomplete(short)),
+        };
+        let bytes = inp.with_range(pos, line_end, |line| {
+            if line == b"END" {
+                Ok(None)
+            } else {
+                scan_value_line(line).map(Some)
+            }
+        })?;
+        let Some(bytes) = bytes else {
+            return Ok(Frame::Complete(line_end + 2));
+        };
+
+        pos = line_end + 2;
+        let data_end = pos + bytes;
+        if inp.len() < data_end + 2 {
+            // The data, its CRLF and at least `END\r\n`.
+            return Ok(Frame::Incomplete(data_end + 2 + END_LEN - inp.len()));
+        }
+        if inp.byte(data_end) != b'\r' || inp.byte(data_end + 1) != b'\n' {
+            return Err(ParseError::Protocol("missing data terminator"));
+        }
+        pos = data_end + 2;
+    }
 }
 
 /// Parse a VALUE response producing zero-copy `ValueBytes` with `Bytes::slice()`.

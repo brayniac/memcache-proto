@@ -5,7 +5,7 @@
 #![cfg(feature = "ascii")]
 
 use bytes::Bytes;
-use memcache_proto::{ParseError, Response, ResponseBytes, Value};
+use memcache_proto::{Frame, ParseError, Response, ResponseBytes, Value};
 
 const ITERATIONS: usize = 50_000;
 const MAX_INPUT_LEN: usize = 48;
@@ -36,6 +36,7 @@ const FIXTURES: &[&[u8]] = &[
     b"VALUE k 0 3\r\nabcX\r\nEND\r\n",
     b"VALUE k 0\r\nEND\r\n",
     b"VALUE k x 3\r\nabc\r\nEND\r\n",
+    b"VALUE k 0 3 x\r\nabc\r\nEND\r\n",
     b"VALUE k 0 3\r\nab",
     b"BOGUS\r\n",
     b"STORED\r",
@@ -200,4 +201,118 @@ fn segmented_values_are_zero_copy_within_a_piece() {
     assert_eq!(&values[1].data[..], b"world");
     assert!(within(&values[0].data, &first));
     assert!(!within(&values[1].data, &first) && !within(&values[1].data, &second));
+}
+
+/// `scan_segments` agrees with the copy parser on any split of an input:
+/// complete with the same length, incomplete, or the same error.
+#[test]
+fn scan_agrees_with_the_copy_parser() {
+    for max_line_len in [memcache_proto::DEFAULT_MAX_RESPONSE_LINE_LEN, 8] {
+        let mut state = 0x7363_616e_6d63;
+        let mut seen = [0usize; 3];
+        for iteration in 0..ITERATIONS {
+            let input = input_for(iteration, &mut state);
+            let copied = Response::parse_with_max_line_len(&input, max_line_len);
+            let mut check = |cuts: &[usize]| {
+                let pieces = split_at(&input, cuts);
+                let scanned = ResponseBytes::scan_segments_with_max_line_len(&pieces, max_line_len);
+                match (&copied, &scanned) {
+                    (Ok((_, n)), Ok(Frame::Complete(m))) if n == m => seen[0] += 1,
+                    (Err(ParseError::Incomplete), Ok(Frame::Incomplete(need))) if *need > 0 => {
+                        seen[1] += 1
+                    }
+                    (Err(e), Err(f)) if e == f => seen[2] += 1,
+                    _ => panic!(
+                        "input {input:?} split at {cuts:?}: parse {copied:?}, scan {scanned:?}"
+                    ),
+                }
+            };
+            for cut in 0..=input.len() {
+                check(&[cut]);
+            }
+            let every: Vec<usize> = (1..input.len()).collect();
+            check(&every);
+        }
+        assert!(seen.iter().all(|&n| n > 0), "{seen:?}");
+    }
+}
+
+/// A random complete response: a simple reply, or one to three values.
+fn response_of(state: &mut u64) -> Vec<u8> {
+    let simple: &[&[u8]] = &[
+        b"STORED\r\n",
+        b"END\r\n",
+        b"12\r\n",
+        // The shortest response.
+        b"0\r\n",
+        b"SERVER_ERROR out of memory\r\n",
+        b"VERSION 1.6.21\r\n",
+    ];
+    if next_u64(state).is_multiple_of(4) {
+        return simple[(next_u64(state) >> 8) as usize % simple.len()].to_vec();
+    }
+    let mut out = Vec::new();
+    for i in 0..1 + (next_u64(state) >> 8) % 3 {
+        let len = (next_u64(state) >> 8) as usize % 40;
+        let cas = if next_u64(state).is_multiple_of(2) {
+            " 77"
+        } else {
+            ""
+        };
+        out.extend_from_slice(format!("VALUE key{i} 3 {len}{cas}\r\n").as_bytes());
+        out.extend((0..len).map(|j| b"ab\r\n"[j % 4]));
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"END\r\n");
+    out
+}
+
+/// Every prefix of a complete response is incomplete with a need of at
+/// least 1 and at most the missing bytes; the whole response is complete at
+/// its length, with or without bytes after it.
+#[test]
+fn every_prefix_needs_at_most_the_missing_bytes() {
+    let mut state = 0x6e65_6564_6d63;
+    let mut prefixes = 0usize;
+    for _ in 0..5_000 {
+        let whole = response_of(&mut state);
+        for len in 0..whole.len() {
+            let cut = (next_u64(&mut state) >> 8) as usize % (len + 1);
+            let pieces = split_at(&whole[..len], &[cut]);
+            match ResponseBytes::scan_segments(&pieces) {
+                Ok(Frame::Incomplete(need)) => assert!(
+                    need >= 1 && need <= whole.len() - len,
+                    "{:?}: {len} bytes, need {need}",
+                    String::from_utf8_lossy(&whole)
+                ),
+                other => panic!(
+                    "{:?}: {len} bytes: {other:?}",
+                    String::from_utf8_lossy(&whole)
+                ),
+            }
+            prefixes += 1;
+        }
+        let mut more = whole.clone();
+        more.extend_from_slice(b"STORED\r\n");
+        for input in [&whole[..], &more[..]] {
+            let cut = (next_u64(&mut state) >> 8) as usize % (input.len() + 1);
+            let pieces = split_at(input, &[cut]);
+            assert_eq!(
+                ResponseBytes::scan_segments(&pieces),
+                Ok(Frame::Complete(whole.len()))
+            );
+        }
+    }
+    assert!(prefixes > 50_000);
+}
+
+/// A value's need is exact once its line is in: the data, its CRLF and
+/// `END\r\n`.
+#[test]
+fn a_value_needs_its_data_and_the_end_line() {
+    let pieces = [Bytes::from_static(b"VALUE k 0 10\r\nab")];
+    assert_eq!(
+        ResponseBytes::scan_segments(&pieces),
+        Ok(Frame::Incomplete(8 + 2 + 5))
+    );
 }

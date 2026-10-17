@@ -78,6 +78,8 @@ pub use error::ParseError;
 #[cfg(feature = "ascii")]
 pub use request::{AddRequest, ReplaceRequest, Request};
 #[cfg(feature = "ascii")]
-pub use response::{DEFAULT_MAX_RESPONSE_LINE_LEN, Response, ResponseBytes, Value, ValueBytes};
+pub use response::{
+    DEFAULT_MAX_RESPONSE_LINE_LEN, Frame, Response, ResponseBytes, Value, ValueBytes,
+};
 #[cfg(feature = "ascii")]
 pub use streaming::{ParseProgress, STREAMING_THRESHOLD, SetHeader, complete_set, parse_streaming};
