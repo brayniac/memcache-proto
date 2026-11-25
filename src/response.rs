@@ -12,6 +12,7 @@
 
 use crate::error::ParseError;
 use crate::input::{Input, Segments};
+use crate::line::find_crlf;
 use bytes::Bytes;
 use std::io::Write;
 
@@ -442,24 +443,6 @@ impl Response {
         buf[pos..pos + 2].copy_from_slice(b"\r\n");
         pos + 2
     }
-}
-
-/// Find the first `\r\n` in `data`, returning the position of the `\r`.
-///
-/// A bare `\r` not followed by `\n` is ordinary line content, so the scan
-/// continues past it; only a real CRLF terminates a line. Returns `None` when
-/// no CRLF is present yet, which callers treat as "need more data".
-fn find_crlf(data: &[u8], max_line_len: usize) -> Result<Option<usize>, ParseError> {
-    if let Some(pos) = memchr::memmem::find(data, b"\r\n") {
-        return Ok(Some(pos));
-    }
-
-    // No CRLF found - check if we've exceeded the line length limit
-    if data.len() > max_line_len {
-        return Err(ParseError::Protocol("line too long"));
-    }
-
-    Ok(None)
 }
 
 /// Default maximum length of a single ASCII response line, in bytes.
@@ -991,6 +974,21 @@ fn parse_usize(data: &[u8]) -> Result<usize, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bare_lf_in_a_response_line_is_line_content() {
+        assert_eq!(
+            Response::parse(b"SERVER_ERROR a\nb\r\n"),
+            Ok((Response::ServerError(b"a\nb".to_vec()), 18))
+        );
+        assert_eq!(
+            Response::parse(b"SERVER_ERROR a\nb"),
+            Err(ParseError::Incomplete)
+        );
+        let (r, n) = ResponseBytes::parse(Bytes::from_static(b"SERVER_ERROR a\nb\r\n")).unwrap();
+        assert_eq!(n, 18);
+        assert!(matches!(r, ResponseBytes::ServerError(m) if m.as_ref() == b"a\nb"));
+    }
 
     #[test]
     fn test_parse_stored() {
@@ -1551,19 +1549,6 @@ mod tests {
     fn test_find_crlf_edge_cases() {
         // \r at end without \n
         assert!(Response::parse(b"STORED\r").is_err());
-    }
-
-    #[test]
-    fn find_crlf_skips_bare_cr() {
-        const MAX: usize = DEFAULT_MAX_RESPONSE_LINE_LEN;
-        // A bare \r is line content, not a terminator: keep scanning.
-        assert_eq!(find_crlf(b"a\rb\r\n", MAX), Ok(Some(3)));
-        assert_eq!(find_crlf(b"\r\n", MAX), Ok(Some(0)));
-        assert_eq!(find_crlf(b"\r\r\n", MAX), Ok(Some(1)));
-        // No CRLF yet -- caller needs more data.
-        assert_eq!(find_crlf(b"a\rb", MAX), Ok(None));
-        assert_eq!(find_crlf(b"abc", MAX), Ok(None));
-        assert_eq!(find_crlf(b"", MAX), Ok(None));
     }
 
     #[test]

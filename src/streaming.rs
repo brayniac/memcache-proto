@@ -37,6 +37,7 @@
 
 use crate::command::{Command, ParseOptions};
 use crate::error::ParseError;
+use crate::line::find_crlf;
 
 /// Threshold for streaming large values (64KB).
 ///
@@ -249,22 +250,6 @@ pub fn complete_set<'a>(header: &SetHeader<'_>, value: &'a [u8]) -> Command<'a> 
     }
 }
 
-/// Find \r\n in buffer, return position of \r.
-fn find_crlf(buffer: &[u8], max_line_len: usize) -> Result<Option<usize>, ParseError> {
-    // A bare `\r` not followed by `\n` is ordinary line content, so scan for a
-    // real CRLF rather than inspecting only the first `\r`.
-    if let Some(pos) = memchr::memmem::find(buffer, b"\r\n") {
-        return Ok(Some(pos));
-    }
-
-    // No CRLF found - check if we've exceeded the line length limit
-    if buffer.len() > max_line_len {
-        return Err(ParseError::Protocol("line too long"));
-    }
-
-    Ok(None)
-}
-
 /// Parse a u32 from ASCII decimal.
 fn parse_u32(data: &[u8]) -> Result<u32, ParseError> {
     std::str::from_utf8(data)
@@ -286,15 +271,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn find_crlf_skips_bare_cr() {
-        const MAX: usize = 1024;
-        assert_eq!(find_crlf(b"a\rb\r\n", MAX), Ok(Some(3)));
-        assert_eq!(find_crlf(b"\r\n", MAX), Ok(Some(0)));
-        assert_eq!(find_crlf(b"a\rb", MAX), Ok(None));
-        // The line-length guard still applies when no CRLF is present.
+    fn a_bare_lf_in_a_command_line_is_line_content() {
+        let opts = ParseOptions::default();
+        match parse_streaming(b"get a\nb\r\n", &opts, STREAMING_THRESHOLD).unwrap() {
+            ParseProgress::Complete(Command::Get { key }, 9) => assert_eq!(key, b"a\nb"),
+            other => panic!("{other:?}"),
+        }
         assert!(matches!(
-            find_crlf(b"aaaaa\rbbbbb", 4),
-            Err(ParseError::Protocol("line too long"))
+            parse_streaming(b"get a\nb", &opts, STREAMING_THRESHOLD),
+            Ok(ParseProgress::Incomplete)
         ));
     }
 
