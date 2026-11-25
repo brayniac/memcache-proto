@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6] - 2026-11-25
+
 ### Added
 
 - `ResponseBytes::parse_segments` and
@@ -19,19 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The crate declares `rust-version = "1.85"`, the minimum that edition 2024
+  already required; 0.0.5 declared none.
 - `Command::parse` and `Command::parse_with_options`, `parse_streaming`,
   `Response::parse` and `Response::parse_with_max_line_len`,
-  `ResponseBytes::parse` and `ResponseBytes::parse_with_max_line_len`, and
-  `ResponseBytes::parse_segments` and `parse_segments_with_max_line_len` when
-  given one piece, find the end of a line with `memchr` for the first `\n`
-  instead of `memchr::memmem::find`, which builds a searcher for each buffer of
-  64 bytes or more. Finding each line end while walking a pipelined buffer of
-  GET hits and STORED replies took 4.05 ns per line instead of 16.4 on an AMD
-  Ryzen 7 7840HS (Zen 4), 9.86 instead of 12.06 on AWS Graviton4, and 6.5
-  instead of 6.9 on Apple M-series. A buffer of bare `\n` with no `\r\n` takes
-  as long as before. `ResponseBytes::parse_segments` with more than one piece is
-  unchanged. What counts as a line end is unchanged: a bare `\r` or `\n` is line
-  content.
+  `ResponseBytes::parse` and `ResponseBytes::parse_with_max_line_len` find the
+  end of a line with `memchr` for the first `\n` instead of
+  `memchr::memmem::find`, which builds a searcher for each buffer of 64 bytes or
+  more. Finding each line end while walking a pipelined buffer of GET hits and
+  STORED replies took 4.05 ns per line instead of 16.4 on an AMD Ryzen 7 7840HS
+  (Zen 4), 9.86 instead of 12.06 on AWS Graviton4, and 6.5 instead of 6.9 on
+  Apple M-series. A buffer of bare `\n` with no `\r\n` takes as long as before.
+  What counts as a line end is unchanged: a bare `\r` or `\n` is line content.
 
 ## [0.0.5] - 2026-08-19
 

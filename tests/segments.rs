@@ -55,7 +55,7 @@ fn input_for(iteration: usize, state: &mut u64) -> Vec<u8> {
             (0..len)
                 .map(|_| {
                     let r = next_u64(state);
-                    if r.is_multiple_of(8) {
+                    if r % 8 == 0 {
                         r as u8
                     } else {
                         ALPHABET[(r >> 8) as usize % ALPHABET.len()]
