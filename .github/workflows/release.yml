@@ -10,6 +10,9 @@ env:
 
 permissions:
   contents: write
+  # ci.yml's audit job asks for checks: write; a called workflow cannot
+  # be granted more than its caller has.
+  checks: write
 
 jobs:
   ci:
